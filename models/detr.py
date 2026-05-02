@@ -18,6 +18,13 @@ from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
 from .transformer import build_transformer
 
 
+# =============================================================================
+# CLASS DETR: KIẾN TRÚC CORE CỦA MÔ HÌNH DETR
+# =============================================================================
+# Đây là module trung tâm thực hiện object detection theo phương pháp end-to-end
+# không cần anchor hay proposal generation như các mô hình truyền thống.
+# Đột phá chính: sử dụng transformer encoder-decoder để trực tiếp dự đoán
+# tập hợp các đối tượng từ ảnh đầu vào.
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
@@ -34,9 +41,41 @@ class DETR(nn.Module):
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
+        # ---------------------------------------------------------------------
+        # CLASS EMBEDDING: Chuyển đổi feature vector thành class probabilities
+        # ---------------------------------------------------------------------
+        # Linear projection từ hidden dimension (512) sang số lớp + 1 (lớp background)
+        # Điểm then chốt: DETR không dùng classification head phức tạp mà chỉ dùng
+        # một layer linear đơn giản, chứng tỏ transformer đã học được representation
+        # đủ mạnh để phân loại.
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+        # ---------------------------------------------------------------------
+        # BOUNDING BOX EMBEDDING: MLP dự đoán tọa độ hộp bao
+        # ---------------------------------------------------------------------
+        # Sử dụng Multi-Layer Perceptron thay vì linear regression vì bài toán
+        # box regression phi tuyến tính cao. Kiến trúc 3 layers với hidden dimension
+        # giữ nguyên cho phép học các biến đổi phức tạp từ feature space sang box coordinates.
+        # Output: 4 giá trị (center_x, center_y, width, height) đã được normalize [0,1].
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        # ---------------------------------------------------------------------
+        # QUERY EMBEDDING: THÀNH PHẦN CỐT LÕI NHẤT CỦA DETR
+        # ---------------------------------------------------------------------
+        # Đây là innovation quan trọng nhất phân biệt DETR với các detector truyền thống.
+        # Mỗi query vector đại diện cho một "detection slot" - một vị trí tiềm năng
+        # để phát hiện đối tượng. Số lượng query (thường 100) quyết định số object
+        # tối đa có thể detect trong một ảnh.
+        # Cơ chế hoạt động: Các query này đóng vai trò như object queries trong decoder,
+        # attend vào encoder features để thu thập thông tin về đối tượng tương ứng.
+        # Qua quá trình training, mỗi query học cách chuyên biệt hóa cho một vị trí
+        # hoặc loại đối tượng cụ thể trong không gian ảnh.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        # ---------------------------------------------------------------------
+        # INPUT PROJECTION: Giảm chiều sâu feature map từ backbone
+        # ---------------------------------------------------------------------
+        # Backbone (ResNet) thường output 2048 channels, cần giảm xuống hidden_dim (512)
+        # để phù hợp với transformer. Conv 1x1 bảo toàn spatial resolution trong khi
+        # giảm chiều sâu, đồng thời học cách transform features sang không gian phù hợp
+        # cho transformer attention.
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
@@ -80,6 +119,23 @@ class DETR(nn.Module):
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
 
+# =============================================================================
+# CLASS SETCRITERION: HÀM LOSS CỦA DETR - HUNGARIAN MATCHING + SUPERVISION
+# =============================================================================
+# Đây là thành phần then chốt thứ hai của DETR sau kiến trúc transformer.
+# Vấn đề cốt lõi trong object detection là làm sao gán predictions (100 queries)
+# với ground truth boxes (thường ít hơn nhiều, ~3-10 objects/image).
+#
+# Giải pháp đột phá: Sử dụng Hungarian matching để tìm one-to-one assignment
+# tối ưu giữa predictions và ground truth, sau đó chỉ compute loss trên các
+# matched pairs. Điều này loại bỏ nhu cầu về non-maximum suppression (NMS)
+# và anchor assignment heuristics như trong các detector truyền thống.
+#
+# Các loss components:
+# 1. Classification loss (cross-entropy): phân loại đối tượng
+# 2. Box regression loss (L1): dự đoán tọa độ hộp bao
+# 3. GIoU loss: đo lường overlap giữa predicted và ground truth boxes
+# 4. Cardinality error (monitoring only): đánh giá số lượng objects phát hiện
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
     The process happens in two steps:
@@ -101,10 +157,24 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
+        # ---------------------------------------------------------------------
+        # CLASS IMBALANCE HANDLING: Xử lý mất cân bằng giữa foreground và background
+        # ---------------------------------------------------------------------
+        # Trong DETR, hầu hết queries sẽ không match với ground truth nào (background).
+        # eos_coef (thường = 0.1) giảm trọng số của class background để tránh việc
+        # model bị bias预测 quá nhiều background. Đây là kỹ thuật tương tự focal loss
+        # nhưng đơn giản hơn trong implementation.
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer('empty_weight', empty_weight)
 
+    # =========================================================================
+    # CLASSIFICATION LOSS: Cross-entropy với class weighting
+    # =========================================================================
+    # Loss này supervises việc phân loại cho các matched queries.
+    # Điểm đặc biệt: chỉ các queries đã được match với ground truth mới contribute
+    # vào loss phân loại cho class foreground. Các unmatched queries tự động học
+    # để predict class background thông qua cross-entropy thông thường.
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
@@ -112,17 +182,36 @@ class SetCriterion(nn.Module):
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
 
+        # ---------------------------------------------------------------------
+        # PERMUTATION INDEX: Xác định vị trí các matched predictions
+        # ---------------------------------------------------------------------
+        # indices từ Hungarian matcher cho biết cặp (prediction_idx, target_idx)
+        # _get_src_permutation_idx chuyển đổi thành batch_idx và src_idx để
+        # indexing vào tensor predictions.
         idx = self._get_src_permutation_idx(indices)
+        # ---------------------------------------------------------------------
+        # TARGET CLASS CONSTRUCTION: Xây dựng target tensor cho toàn bộ queries
+        # ---------------------------------------------------------------------
+        # Kỹ thuật quan trọng: Tạo một tensor đầy với class background (num_classes)
+        # sau đó overwrite các vị trí matched với ground truth class tương ứng.
+        # Cách làm này cho phép compute cross-entropy trên tất cả queries cùng lúc
+        # thay vì phải loop qua từng sample trong batch.
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
 
+        # ---------------------------------------------------------------------
+        # CROSS ENTROPY COMPUTATION: Tính loss với class weighting
+        # ---------------------------------------------------------------------
+        # Sử dụng empty_weight đã đăng ký ở trên để penalize ít hơn cho background class.
+        # Transpose (1, 2) cần thiết vì cross_entropy expects shape [N, C, ...]
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         losses = {'loss_ce': loss_ce}
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
+            # Accuracy monitoring cho matched predictions only
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
 
@@ -140,21 +229,52 @@ class SetCriterion(nn.Module):
         losses = {'cardinality_error': card_err}
         return losses
 
+    # =========================================================================
+    # BOX REGRESSION LOSSES: L1 + GIoU
+    # =========================================================================
+    # DETR sử dụng kết hợp hai loss functions cho bounding box regression:
+    # 1. L1 loss: Trực tiếp penalize khoảng cách giữa predicted và target coordinates
+    # 2. GIoU loss: Measure quality của box prediction dựa trên overlap
+    #
+    # Sự kết hợp này quan trọng vì:
+    # - L1 loss đảm bảo hội tụ ổn định và gradient không biến mất khi boxes xa nhau
+    # - GIoU loss cung cấp signal mạnh hơn khi boxes gần nhau và có overlap
+    # - Cả hai đều scale-invariant, quan trọng cho multi-scale detection
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
         """
         assert 'pred_boxes' in outputs
+        # Lấy indices của matched predictions
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs['pred_boxes'][idx]
+        # Concatenate tất cả ground truth boxes tương ứng với matched indices
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
+        # ---------------------------------------------------------------------
+        # L1 LOSS: Khoảng cách tuyệt đối giữa predicted và target coordinates
+        # ---------------------------------------------------------------------
+        # reduction='none' giữ nguyên per-element loss để có thể sum và normalize
+        # theo num_boxes sau. L1 loss được chọn thay vì smooth L1 vì đơn giản
+        # và hoạt động tốt trong practice cho DETR.
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
 
         losses = {}
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
+        # ---------------------------------------------------------------------
+        # GIOU LOSS: Generalized Intersection over Union
+        # ---------------------------------------------------------------------
+        # GIoU mở rộng IoU bằng cách phạt các cases mà predicted box và target box
+        # không overlap nhưng vẫn có enclosing box nhỏ nhất. Giá trị GIoU nằm trong
+        # [-1, 1], với 1 là perfect match.
+        # 
+        # box_cxcywh_to_xyxy: Chuyển từ format (center_x, center_y, w, h) sang
+        # (x0, y0, x1, y1) vì GIoU computation requires corner coordinates.
+        #
+        # torch.diag: Chỉ lấy diagonal elements vì mỗi predicted box chỉ so sánh
+        # với ground truth box tương ứng đã được match, không phải tất cả pairs.
         loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(src_boxes),
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
@@ -255,6 +375,14 @@ class SetCriterion(nn.Module):
         return losses
 
 
+# =============================================================================
+# CLASS POSTPROCESS: CHUYỂN ĐỔI OUTPUTS THÀNH COCO FORMAT
+# =============================================================================
+# Module này thực hiện post-processing cần thiết để chuyển raw model outputs
+# thành format chuẩn cho evaluation hoặc visualization. Các bước chính:
+# 1. Softmax để có class probabilities
+# 2. Convert box coordinates từ normalized cxcywh sang absolute xyxy
+# 3. Scale boxes về kích thước ảnh gốc
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
     @torch.no_grad()
@@ -271,12 +399,33 @@ class PostProcess(nn.Module):
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
 
+        # ---------------------------------------------------------------------
+        # CLASS PROBABILITY COMPUTATION
+        # ---------------------------------------------------------------------
+        # Softmax over classes để có probability distribution.
+        # prob[..., :-1].max(-1): Lấy class có xác suất cao nhất (excluding background).
+        # scores: confidence score của class được chọn
+        # labels: class id tương ứng
         prob = F.softmax(out_logits, -1)
         scores, labels = prob[..., :-1].max(-1)
 
         # convert to [x0, y0, x1, y1] format
+        # ---------------------------------------------------------------------
+        # BOX FORMAT CONVERSION: cxcywh -> xyxy
+        # ---------------------------------------------------------------------
+        # DETR predicts boxes ở format (center_x, center_y, width, height) vì:
+        # - Dễ dàng cho transformer learning (decoupled center và size)
+        # - Symmetric và stable gradient
+        # Tuy nhiên, COCO evaluation và NMS yêu cầu format (x0, y0, x1, y2).
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
         # and from relative [0, 1] to absolute [0, height] coordinates
+        # ---------------------------------------------------------------------
+        # DENERMALIZATION: Chuyển từ tọa độ normalized sang pixel coordinates
+        # ---------------------------------------------------------------------
+        # Boxes được normalize trong [0, 1] trong quá trình training để:
+        # - Independence với image size
+        # - Stable optimization
+        # Ở inference, cần scale về kích thước ảnh thực tế.
         img_h, img_w = target_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
@@ -286,6 +435,17 @@ class PostProcess(nn.Module):
         return results
 
 
+# =============================================================================
+# CLASS MLP: MULTI-LAYER PERCEPTRON CHO PREDICTION HEADS
+# =============================================================================
+# Kiến trúc FFN đơn giản dùng cho bbox prediction head.
+# Đặc điểm thiết kế:
+# - ReLU activation ở tất cả layers trừ layer cuối
+# - No normalization layers (BatchNorm/LayerNorm)
+# - Skip connection không được sử dụng vì mạng đã đủ nông (3 layers)
+#
+# Lý do dùng MLP thay vì linear: Box regression là bài toán phi tuyến phức tạp,
+# cần capacity cao hơn để học transformation từ feature space sang coordinate space.
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
 
@@ -301,6 +461,16 @@ class MLP(nn.Module):
         return x
 
 
+# =============================================================================
+# FUNCTION BUILD: FACTORY METHOD TẠO TOÀN BỘ MODEL PIPELINE
+# =============================================================================
+# Đây là entry point chính để xây dựng toàn bộ hệ thống DETR bao gồm:
+# 1. Model architecture (backbone + transformer + heads)
+# 2. Criterion (matcher + loss functions)
+# 3. Postprocessors (inference-time transformations)
+#
+# Function này encapsulates tất cả configuration choices và đảm bảo các 
+# components được khởi tạo đồng bộ với nhau.
 def build(args):
     # the `num_classes` naming here is somewhat misleading.
     # it indeed corresponds to `max_obj_id + 1`, where max_obj_id
