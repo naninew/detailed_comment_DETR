@@ -1,1 +1,6 @@
-(models/, backbone.py, models/detr.py)
+```
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+```
