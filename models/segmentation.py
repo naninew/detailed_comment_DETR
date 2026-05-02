@@ -21,19 +21,62 @@ except ImportError:
     pass
 
 
+# =============================================================================
+# DETRsegm - MỞ RỘNG DETR CHO INSTANCE/PANOPTIC SEGMENTATION
+# =============================================================================
+# Class này kế thừa DETR detection model và thêm các components để thực hiện
+# segmentation. Kiến trúc bao gồm:
+#
+# 1. BBox Attention Module (MHAttentionMap):
+#    - Tạo attention maps từ object queries và encoder memory
+#    - Mỗi query sinh ra một mask attention map tương ứng với predicted box
+#    - Attention maps này hướng dẫn mask head tập trung vào đúng regions
+#
+# 2. Mask Head (MaskHeadSmallConv):
+#    - Simple convolutional network với GroupNorm
+#    - Sử dụng FPN (Feature Pyramid Network) để kết hợp multi-scale features
+#    - Input: projected features + bbox attention maps + FPN features từ backbone
+#    - Output: binary masks cho mỗi object query
+#
+# Tại sao dùng architecture này:
+# - Tận dụng được pretrained DETR weights cho detection
+# - BBox attention giúp align masks với predicted boxes
+# - FPN cung cấp multi-scale information cho accurate mask prediction
+# =============================================================================
 class DETRsegm(nn.Module):
     def __init__(self, detr, freeze_detr=False):
         super().__init__()
         self.detr = detr
 
+        # Freeze DETR backbone nếu chỉ muốn train segmentation heads
+        # Hữu ích khi fine-tuning từ pretrained detection model
         if freeze_detr:
             for p in self.parameters():
                 p.requires_grad_(False)
 
         hidden_dim, nheads = detr.transformer.d_model, detr.transformer.nhead
+        # BBox attention module tạo attention maps từ decoder outputs và encoder memory
         self.bbox_attention = MHAttentionMap(hidden_dim, hidden_dim, nheads, dropout=0.0)
+        # Mask head nhận vào features + attention maps để predict masks
+        # Input dimension = hidden_dim + nheads (từ bbox attention maps)
         self.mask_head = MaskHeadSmallConv(hidden_dim + nheads, [1024, 512, 256], hidden_dim)
 
+    # ==========================================================================
+    # FORWARD - PREDICT BOXES VÀ MASKS TỪ INPUT IMAGES
+    # ==========================================================================
+    # Pipeline xử lý:
+    # 1. Backbone (ResNet) trích xuất multi-scale features
+    # 2. Transformer encoder-decoder xử lý features với object queries
+    # 3. Classification và bbox regression heads (giống DETR detection)
+    # 4. BBox attention tạo attention maps từ last decoder output
+    # 5. Mask head kết hợp projected features + attention maps + FPN features
+    #
+    # Output bao gồm:
+    # - pred_logits: class predictions cho mỗi query
+    # - pred_boxes: box coordinates predictions
+    # - pred_masks: segmentation masks cho mỗi query
+    # - aux_outputs: auxiliary predictions từ intermediate layers (nếu có)
+    # ==========================================================================
     def forward(self, samples: NestedTensor):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
@@ -53,8 +96,13 @@ class DETRsegm(nn.Module):
             out['aux_outputs'] = self.detr._set_aux_loss(outputs_class, outputs_coord)
 
         # FIXME h_boxes takes the last one computed, keep this in mind
+        # Sử dụng last decoder layer output để tạo bbox attention maps
         bbox_mask = self.bbox_attention(hs[-1], memory, mask=mask)
 
+        # Mask head kết hợp:
+        # - src_proj: Projected features từ highest level của backbone
+        # - bbox_mask: Attention maps hướng dẫn vùng cần segment
+        # - fpn features: Multi-scale features từ các levels khác nhau của backbone
         seg_masks = self.mask_head(src_proj, bbox_mask, [features[2].tensors, features[1].tensors, features[0].tensors])
         outputs_seg_masks = seg_masks.view(bs, self.detr.num_queries, seg_masks.shape[-2], seg_masks.shape[-1])
 
@@ -62,10 +110,39 @@ class DETRsegm(nn.Module):
         return out
 
 
+# =============================================================================
+# EXPAND HELPER - BROADCAST TENSOR CHO BATCH DIMENSION
+# =============================================================================
+# Hàm utility để mở rộng tensor theo batch dimension khi cần thiết.
+# Được sử dụng trong mask head khi cần align số lượng samples giữa
+# bbox masks (num_queries * batch) và FPN features (batch)
+# =============================================================================
 def _expand(tensor, length: int):
     return tensor.unsqueeze(1).repeat(1, int(length), 1, 1, 1).flatten(0, 1)
 
 
+# =============================================================================
+# MASKHEADSMALLCONV - MASK PREDICTION HEAD VỚI FPN
+# =============================================================================
+# Kiến trúc mask head đơn giản nhưng hiệu quả:
+#
+# 1. Initial Convolutional Block:
+#    - Xử lý concatenated input (features + bbox attention)
+#    - Sử dụng GroupNorm thay vì BatchNorm (phù hợp với small batch sizes)
+#
+# 2. FPN Fusion Blocks (3 stages):
+#    - Mỗi stage: adapter conv -> upsample -> add với FPN feature -> conv
+#    - Progressive upsampling kết hợp với high-resolution features từ FPN
+#    - Giúp mask predictions có độ chi tiết cao
+#
+# 3. Output Layer:
+#    - Single channel convolution cho binary mask prediction
+#
+# Tại sao dùng architecture này:
+# - Đơn giản, ít parameters, dễ train
+# - FPN giúp capture multi-scale context
+# - GroupNorm ổn định hơn BatchNorm với small batches
+# =============================================================================
 class MaskHeadSmallConv(nn.Module):
     """
     Simple convolutional head, using group norm.
